@@ -11,30 +11,54 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    ExemptionRequest,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    ReceiptSubmission,
+    Route,
+    StationDeclaration,
+    SupplyScenario,
+    TransmissionBoundary,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
+    RampPoint,
     allocate_capacity,
     canonical_json,
     decimal_text,
     delivered_after_loss,
     digest,
     effective_capacity,
+    evaluate_commitment,
+    form_commitment_phases,
     latest_streak,
     moving_average,
     quantize_volume,
     scenario_projection,
+    settle_receipt,
     weighted_inventory_cost,
 )
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "plan.read"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "boundary.write",
+        "plan.confirm",
+        "plan.read",
+    },
+    "station": {"declaration.write", "receipt.write", "plan.read"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "exemption.write", "plan.read"},
+    "auditor": {"report.read", "audit.read", "plan.read"},
 }
 
 
@@ -569,3 +593,611 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    # ---- 分阶段送出承诺门禁 ----
+
+    def _plan_row(self, plan_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM commitment_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("承诺计划不存在")
+        return row
+
+    def _plan_summary(self, plan_id: str) -> dict[str, Any]:
+        row = self._plan_row(plan_id)
+        return {
+            "plan_id": row["plan_id"],
+            "state": row["state"],
+            "outcome": row["outcome"],
+            "committed_mw": row["committed_mw"],
+            "boundary_version": row["boundary_version"],
+        }
+
+    def _held_locks(self, route_id: str, service_date: str) -> tuple[Decimal, Decimal]:
+        rows = self.connection.execute(
+            "SELECT channel_mw,compensation_mvar FROM commitment_locks "
+            "WHERE route_id=? AND service_date=? AND state='held'",
+            (route_id, service_date),
+        ).fetchall()
+        channel = sum((Decimal(row["channel_mw"]) for row in rows), Decimal("0"))
+        compensation = sum((Decimal(row["compensation_mvar"]) for row in rows), Decimal("0"))
+        return channel, compensation
+
+    def _boundary_outage_percents(self, boundary: sqlite3.Row) -> list[Decimal]:
+        rows = self.connection.execute(
+            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
+            "AND starts_at<? AND (ends_at IS NULL OR ends_at>?) ORDER BY outage_id",
+            (boundary["route_id"], boundary["effective_until"], boundary["effective_from"]),
+        ).fetchall()
+        return [Decimal(row["capacity_percent"]) for row in rows]
+
+    def _boundary_channel_ceiling(self, boundary: sqlite3.Row) -> Decimal:
+        base = min(Decimal(boundary["channel_capacity_mw"]), Decimal(boundary["cable_thermal_limit_mw"]))
+        return effective_capacity(base, self._boundary_outage_percents(boundary))
+
+    def _build_evaluation(
+        self, declaration: sqlite3.Row, boundary: sqlite3.Row
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        ramp_points = [
+            RampPoint(int(point["offset_minutes"]), Decimal(str(point["mw"])))
+            for point in json.loads(declaration["ramp_json"])
+        ]
+        start = parse_utc(boundary["effective_from"], "effective_from")
+        end = parse_utc(boundary["effective_until"], "effective_until")
+        window_minutes = int((end - start).total_seconds() // 60)
+        if ramp_points[-1].offset_minutes >= window_minutes:
+            raise ValidationFailed("爬坡曲线超出边界有效期窗口")
+        held_channel, held_compensation = self._held_locks(boundary["route_id"], boundary["service_date"])
+        evaluation = evaluate_commitment(
+            declared_target_mw=ramp_points[-1].mw,
+            installed_mw=Decimal(declaration["installed_mw"]),
+            availability_percent=Decimal(declaration["availability_percent"]),
+            reserve_mw=Decimal(declaration["reserve_mw"]),
+            channel_capacity_mw=Decimal(boundary["channel_capacity_mw"]),
+            cable_thermal_limit_mw=Decimal(boundary["cable_thermal_limit_mw"]),
+            outage_percents=self._boundary_outage_percents(boundary),
+            compensation_mvar=Decimal(boundary["compensation_mvar"]),
+            compensation_ratio=Decimal(boundary["compensation_ratio"]),
+            held_channel_mw=held_channel,
+            held_compensation_mvar=held_compensation,
+        )
+        phases = form_commitment_phases(
+            window_start=start,
+            window_minutes=window_minutes,
+            ramp_points=ramp_points,
+            committed_mw=Decimal(evaluation["committed_mw"]),
+        )
+        return evaluation, phases
+
+    def _form_plan(self, declaration: sqlite3.Row, boundary: sqlite3.Row, actor_id: str) -> str:
+        evaluation, phases = self._build_evaluation(declaration, boundary)
+        plan_id = f"plan-{declaration['declaration_id']}"
+        now = self._now()
+        self.connection.execute(
+            "INSERT INTO commitment_plans(plan_id,declaration_id,route_id,service_date,boundary_id,"
+            "boundary_version,state,outcome,committed_mw,phases_json,evaluation_json,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?,?)",
+            (
+                plan_id,
+                declaration["declaration_id"],
+                declaration["route_id"],
+                declaration["service_date"],
+                boundary["boundary_id"],
+                boundary["version"],
+                evaluation["outcome"],
+                evaluation["committed_mw"],
+                canonical_json(phases),
+                canonical_json(evaluation),
+                now,
+                now,
+            ),
+        )
+        self._audit(
+            "commitment_plan",
+            plan_id,
+            "plan.formed",
+            actor_id,
+            {
+                "boundary_version": boundary["version"],
+                "outcome": evaluation["outcome"],
+                "committed_mw": evaluation["committed_mw"],
+            },
+        )
+        return plan_id
+
+    def _reevaluate_plan(self, plan: sqlite3.Row, boundary: sqlite3.Row, actor_id: str) -> None:
+        declaration = self.connection.execute(
+            "SELECT * FROM station_declarations WHERE declaration_id=?", (plan["declaration_id"],)
+        ).fetchone()
+        evaluation, phases = self._build_evaluation(declaration, boundary)
+        self.connection.execute(
+            "UPDATE commitment_plans SET boundary_id=?,boundary_version=?,outcome=?,committed_mw=?,"
+            "phases_json=?,evaluation_json=?,revision=revision+1,updated_at=? WHERE plan_id=? AND state='pending'",
+            (
+                boundary["boundary_id"],
+                boundary["version"],
+                evaluation["outcome"],
+                evaluation["committed_mw"],
+                canonical_json(phases),
+                canonical_json(evaluation),
+                self._now(),
+                plan["plan_id"],
+            ),
+        )
+        self._audit(
+            "commitment_plan",
+            plan["plan_id"],
+            "plan.reevaluated",
+            actor_id,
+            {
+                "previous_boundary_version": plan["boundary_version"],
+                "boundary_version": boundary["version"],
+                "outcome": evaluation["outcome"],
+                "committed_mw": evaluation["committed_mw"],
+            },
+        )
+
+    def publish_boundary(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "boundary.write")
+        boundary = TransmissionBoundary.from_dict(raw)
+        self.route(boundary.route_id)
+        latest = self.connection.execute(
+            "SELECT max(version) AS max_version FROM transmission_boundaries WHERE route_id=? AND service_date=?",
+            (boundary.route_id, boundary.service_date),
+        ).fetchone()
+        max_version = latest["max_version"]
+        if max_version is not None and boundary.version <= int(max_version):
+            raise Conflict("边界版本必须大于当前已发布版本")
+        formed: list[str] = []
+        reevaluated: list[str] = []
+        skipped: list[str] = []
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO transmission_boundaries(route_id,service_date,version,channel_capacity_mw,"
+                "cable_thermal_limit_mw,compensation_mvar,compensation_ratio,effective_from,effective_until,"
+                "published_by,published_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    boundary.route_id,
+                    boundary.service_date,
+                    boundary.version,
+                    decimal_text(boundary.channel_capacity_mw),
+                    decimal_text(boundary.cable_thermal_limit_mw),
+                    decimal_text(boundary.compensation_mvar),
+                    decimal_text(boundary.compensation_ratio),
+                    utc_text(parse_utc(boundary.effective_from, "effective_from")),
+                    utc_text(parse_utc(boundary.effective_until, "effective_until")),
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            boundary_id = int(cursor.lastrowid)
+            boundary_row = self.connection.execute(
+                "SELECT * FROM transmission_boundaries WHERE boundary_id=?", (boundary_id,)
+            ).fetchone()
+            self._audit(
+                "transmission_boundary",
+                str(boundary_id),
+                "boundary.published",
+                actor_id,
+                {
+                    "route_id": boundary.route_id,
+                    "service_date": boundary.service_date,
+                    "version": boundary.version,
+                },
+            )
+            declarations = self.connection.execute(
+                "SELECT * FROM station_declarations WHERE route_id=? AND service_date=? AND declaration_id NOT IN "
+                "(SELECT declaration_id FROM commitment_plans) ORDER BY submitted_at,declaration_id",
+                (boundary.route_id, boundary.service_date),
+            ).fetchall()
+            for declaration in declarations:
+                try:
+                    formed.append(self._form_plan(declaration, boundary_row, actor_id))
+                except ValidationFailed:
+                    skipped.append(declaration["declaration_id"])
+            pending = self.connection.execute(
+                "SELECT * FROM commitment_plans WHERE route_id=? AND service_date=? AND state='pending' "
+                "AND boundary_id<>? ORDER BY plan_id",
+                (boundary.route_id, boundary.service_date, boundary_id),
+            ).fetchall()
+            for plan in pending:
+                try:
+                    self._reevaluate_plan(plan, boundary_row, actor_id)
+                    reevaluated.append(plan["plan_id"])
+                except ValidationFailed:
+                    skipped.append(plan["plan_id"])
+        return {
+            "boundary_id": boundary_id,
+            "route_id": boundary.route_id,
+            "service_date": boundary.service_date,
+            "version": boundary.version,
+            "formed_plan_ids": formed,
+            "reevaluated_plan_ids": reevaluated,
+            "skipped_ids": skipped,
+        }
+
+    def submit_declaration(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "declaration.write")
+        declaration = StationDeclaration.from_dict(raw)
+        request_digest = digest(raw)
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM supply_idempotency WHERE scope='declaration' AND idempotency_key=?",
+            (declaration.idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同申报内容")
+            return json.loads(stored["response_json"])
+        route = self.route(declaration.route_id)
+        if route["state"] != "active":
+            raise InvalidState("送出通道当前不可申报")
+        boundary = self.connection.execute(
+            "SELECT * FROM transmission_boundaries WHERE route_id=? AND service_date=? "
+            "ORDER BY version DESC LIMIT 1",
+            (declaration.route_id, declaration.service_date),
+        ).fetchone()
+        ramp_json = canonical_json(
+            [{"offset_minutes": point.offset_minutes, "mw": decimal_text(point.mw)} for point in declaration.ramp_points]
+        )
+        respond_by = utc_text(parse_utc(declaration.respond_by, "respond_by"))
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO station_declarations(declaration_id,route_id,service_date,installed_mw,"
+                    "availability_percent,ramp_json,reserve_mw,respond_by,idempotency_key,submitted_by,submitted_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        declaration.declaration_id,
+                        declaration.route_id,
+                        declaration.service_date,
+                        decimal_text(declaration.installed_mw),
+                        decimal_text(declaration.availability_percent),
+                        ramp_json,
+                        decimal_text(declaration.reserve_mw),
+                        respond_by,
+                        declaration.idempotency_key,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "station_declaration",
+                    declaration.declaration_id,
+                    "declaration.submitted",
+                    actor_id,
+                    {"route_id": declaration.route_id, "service_date": declaration.service_date},
+                )
+                plan_summary = None
+                if boundary is not None:
+                    declaration_row = self.connection.execute(
+                        "SELECT * FROM station_declarations WHERE declaration_id=?",
+                        (declaration.declaration_id,),
+                    ).fetchone()
+                    plan_summary = self._plan_summary(self._form_plan(declaration_row, boundary, actor_id))
+                response = {
+                    "declaration_id": declaration.declaration_id,
+                    "route_id": declaration.route_id,
+                    "service_date": declaration.service_date,
+                    "state": "planned" if plan_summary is not None else "awaiting_boundary",
+                    "plan": plan_summary,
+                }
+                self.connection.execute(
+                    "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('declaration',?,?,?,?)",
+                    (declaration.idempotency_key, request_digest, canonical_json(response), self._now()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("申报编号或幂等键冲突") from exc
+        return response
+
+    def grant_exemption(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "exemption.write")
+        request = ExemptionRequest.from_dict(raw)
+        plan = self._plan_row(request.plan_id)
+        if plan["state"] != "pending":
+            raise InvalidState("只有待确认计划可以登记豁免")
+        expires_at = utc_text(parse_utc(request.expires_at, "expires_at"))
+        if parse_utc(expires_at, "expires_at") <= self.clock.now():
+            raise ValidationFailed("expires_at 必须晚于当前时间")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO exemptions(plan_id,authorized_by,reason,expires_at,created_at) VALUES(?,?,?,?,?)",
+                (request.plan_id, actor_id, request.reason, expires_at, self._now()),
+            )
+            exemption_id = int(cursor.lastrowid)
+            self._audit(
+                "commitment_plan",
+                request.plan_id,
+                "exemption.granted",
+                actor_id,
+                {"exemption_id": exemption_id, "reason": request.reason, "expires_at": expires_at},
+            )
+        return {
+            "exemption_id": exemption_id,
+            "plan_id": request.plan_id,
+            "authorized_by": actor_id,
+            "reason": request.reason,
+            "expires_at": expires_at,
+        }
+
+    def _active_exemption(self, plan_id: str) -> sqlite3.Row | None:
+        rows = self.connection.execute(
+            "SELECT * FROM exemptions WHERE plan_id=? ORDER BY exemption_id DESC", (plan_id,)
+        ).fetchall()
+        now = self.clock.now()
+        for row in rows:
+            if parse_utc(row["expires_at"], "expires_at") > now:
+                return row
+        return None
+
+    def confirm_plan(self, actor_id: str, plan_id: str) -> dict[str, Any]:
+        self._require(actor_id, "plan.confirm")
+        plan = self._plan_row(plan_id)
+        if plan["state"] != "pending":
+            raise InvalidState("计划不是待确认状态")
+        declaration = self.connection.execute(
+            "SELECT * FROM station_declarations WHERE declaration_id=?", (plan["declaration_id"],)
+        ).fetchone()
+        boundary = self.connection.execute(
+            "SELECT * FROM transmission_boundaries WHERE boundary_id=?", (plan["boundary_id"],)
+        ).fetchone()
+        overdue = self.clock.now() > parse_utc(declaration["respond_by"], "respond_by")
+        exemption_needed = plan["outcome"] == "exemption_required" or overdue
+        exemption = self._active_exemption(plan_id) if exemption_needed else None
+        if exemption_needed and exemption is None:
+            if overdue:
+                raise InvalidState("已超过最迟响应时刻，需要紧急保供豁免才能确认")
+            raise InvalidState("计划需要紧急保供豁免才能确认")
+        committed = Decimal(plan["committed_mw"])
+        compensation_need = quantize_volume(committed * Decimal(boundary["compensation_ratio"]))
+        with transaction(self.connection, immediate=True):
+            if exemption is None:
+                ceiling = self._boundary_channel_ceiling(boundary)
+                held_channel, held_compensation = self._held_locks(plan["route_id"], plan["service_date"])
+                if held_channel + committed > ceiling:
+                    raise Conflict("送出通道余量不足，确认失败且未锁定任何资源")
+                if held_compensation + compensation_need > Decimal(boundary["compensation_mvar"]):
+                    raise Conflict("无功补偿余量不足，确认失败且未锁定任何资源")
+            cursor = self.connection.execute(
+                "INSERT INTO commitment_locks(plan_id,route_id,service_date,channel_mw,compensation_mvar,state,"
+                "exemption_id,created_by,created_at) VALUES(?,?,?,?,?,'held',?,?,?)",
+                (
+                    plan_id,
+                    plan["route_id"],
+                    plan["service_date"],
+                    decimal_text(committed),
+                    decimal_text(compensation_need),
+                    None if exemption is None else exemption["exemption_id"],
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            lock_id = int(cursor.lastrowid)
+            updated = self.connection.execute(
+                "UPDATE commitment_plans SET state='confirmed',revision=revision+1,updated_at=? "
+                "WHERE plan_id=? AND state='pending'",
+                (self._now(), plan_id),
+            )
+            if updated.rowcount != 1:
+                raise InvalidState("计划不是待确认状态")
+            self._audit(
+                "commitment_plan",
+                plan_id,
+                "plan.confirmed",
+                actor_id,
+                {
+                    "lock_id": lock_id,
+                    "channel_mw": decimal_text(committed),
+                    "compensation_mvar": decimal_text(compensation_need),
+                    "exemption_id": None if exemption is None else exemption["exemption_id"],
+                },
+            )
+        return {
+            "plan_id": plan_id,
+            "state": "confirmed",
+            "lock_id": lock_id,
+            "locked": {
+                "channel_mw": decimal_text(committed),
+                "compensation_mvar": decimal_text(compensation_need),
+            },
+            "exemption_id": None if exemption is None else exemption["exemption_id"],
+        }
+
+    def submit_receipt(self, actor_id: str, plan_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "receipt.write")
+        receipt = ReceiptSubmission.from_dict(raw)
+        request_digest = digest({"plan_id": plan_id, "payload": raw})
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM supply_idempotency WHERE scope='receipt' AND idempotency_key=?",
+            (receipt.idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同回执内容")
+            return json.loads(stored["response_json"])
+        plan = self._plan_row(plan_id)
+        if plan["state"] != "confirmed":
+            raise InvalidState("计划不是已确认状态，不能登记执行回执")
+        phases = json.loads(plan["phases_json"])
+        settlement = settle_receipt(phases, receipt.actuals)
+        response = {
+            "receipt_id": receipt.receipt_id,
+            "plan_id": plan_id,
+            "state": "settled",
+            **settlement,
+        }
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO execution_receipts(receipt_id,plan_id,idempotency_key,actuals_json,settled_mwh,"
+                    "shortfall_mwh,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        receipt.receipt_id,
+                        plan_id,
+                        receipt.idempotency_key,
+                        canonical_json({phase: decimal_text(value) for phase, value in receipt.actuals.items()}),
+                        settlement["settled_mwh"],
+                        settlement["shortfall_mwh"],
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE commitment_locks SET state='released',released_at=? WHERE plan_id=? AND state='held'",
+                    (self._now(), plan_id),
+                )
+                self.connection.execute(
+                    "UPDATE commitment_plans SET state='settled',revision=revision+1,updated_at=? WHERE plan_id=?",
+                    (self._now(), plan_id),
+                )
+                self._audit(
+                    "commitment_plan",
+                    plan_id,
+                    "plan.settled",
+                    actor_id,
+                    {
+                        "receipt_id": receipt.receipt_id,
+                        "settled_mwh": settlement["settled_mwh"],
+                        "shortfall_mwh": settlement["shortfall_mwh"],
+                    },
+                )
+                self.connection.execute(
+                    "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('receipt',?,?,?,?)",
+                    (receipt.idempotency_key, request_digest, canonical_json(response), self._now()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("回执编号或幂等键冲突") from exc
+        return response
+
+    def commitment_plan(self, actor_id: str, plan_id: str) -> dict[str, Any]:
+        self._require(actor_id, "plan.read")
+        plan = self._plan_row(plan_id)
+        declaration = self.connection.execute(
+            "SELECT * FROM station_declarations WHERE declaration_id=?", (plan["declaration_id"],)
+        ).fetchone()
+        boundary = self.connection.execute(
+            "SELECT * FROM transmission_boundaries WHERE boundary_id=?", (plan["boundary_id"],)
+        ).fetchone()
+        locks = self.connection.execute(
+            "SELECT * FROM commitment_locks WHERE plan_id=? ORDER BY lock_id", (plan_id,)
+        ).fetchall()
+        exemptions = self.connection.execute(
+            "SELECT * FROM exemptions WHERE plan_id=? ORDER BY exemption_id", (plan_id,)
+        ).fetchall()
+        receipt = self.connection.execute(
+            "SELECT * FROM execution_receipts WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        events = self.connection.execute(
+            "SELECT event_type,actor_id,payload_json,created_at FROM supply_audit_events "
+            "WHERE entity_type='commitment_plan' AND entity_id=? ORDER BY event_id",
+            (plan_id,),
+        ).fetchall()
+        now = self.clock.now()
+        response_overdue = plan["state"] == "pending" and now > parse_utc(
+            declaration["respond_by"], "respond_by"
+        )
+        requires_exemption = plan["state"] == "pending" and (
+            plan["outcome"] == "exemption_required" or response_overdue
+        )
+        return {
+            "plan_id": plan["plan_id"],
+            "state": plan["state"],
+            "outcome": plan["outcome"],
+            "route_id": plan["route_id"],
+            "service_date": plan["service_date"],
+            "revision": plan["revision"],
+            "committed_mw": plan["committed_mw"],
+            "boundary": {
+                "boundary_id": boundary["boundary_id"],
+                "version": boundary["version"],
+                "channel_capacity_mw": boundary["channel_capacity_mw"],
+                "cable_thermal_limit_mw": boundary["cable_thermal_limit_mw"],
+                "compensation_mvar": boundary["compensation_mvar"],
+                "compensation_ratio": boundary["compensation_ratio"],
+                "effective_from": boundary["effective_from"],
+                "effective_until": boundary["effective_until"],
+            },
+            "declaration": {
+                "declaration_id": declaration["declaration_id"],
+                "installed_mw": declaration["installed_mw"],
+                "availability_percent": declaration["availability_percent"],
+                "reserve_mw": declaration["reserve_mw"],
+                "respond_by": declaration["respond_by"],
+                "submitted_by": declaration["submitted_by"],
+            },
+            "phases": json.loads(plan["phases_json"]),
+            "evaluation": json.loads(plan["evaluation_json"]),
+            "requires_exemption": requires_exemption,
+            "response_overdue": response_overdue,
+            "exemptions": [
+                {
+                    "exemption_id": row["exemption_id"],
+                    "authorized_by": row["authorized_by"],
+                    "reason": row["reason"],
+                    "expires_at": row["expires_at"],
+                    "active": parse_utc(row["expires_at"], "expires_at") > now,
+                }
+                for row in exemptions
+            ],
+            "locks": [
+                {
+                    "lock_id": row["lock_id"],
+                    "channel_mw": row["channel_mw"],
+                    "compensation_mvar": row["compensation_mvar"],
+                    "state": row["state"],
+                    "exemption_id": row["exemption_id"],
+                    "created_at": row["created_at"],
+                    "released_at": row["released_at"],
+                }
+                for row in locks
+            ],
+            "receipt": None
+            if receipt is None
+            else {
+                "receipt_id": receipt["receipt_id"],
+                "settled_mwh": receipt["settled_mwh"],
+                "shortfall_mwh": receipt["shortfall_mwh"],
+                "submitted_by": receipt["submitted_by"],
+                "submitted_at": receipt["submitted_at"],
+            },
+            "decision_log": [
+                {
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": row["created_at"],
+                }
+                for row in events
+            ],
+        }
+
+    def list_plans(
+        self,
+        actor_id: str,
+        *,
+        state: str | None = None,
+        route_id: str | None = None,
+        service_date: str | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "plan.read")
+        clauses: list[str] = []
+        params: list[str] = []
+        if state is not None:
+            if state not in ("pending", "confirmed", "settled", "cancelled"):
+                raise ValidationFailed("state 不是受支持的计划状态")
+            clauses.append("state=?")
+            params.append(state)
+        if route_id is not None:
+            clauses.append("route_id=?")
+            params.append(route_id)
+        if service_date is not None:
+            clauses.append("service_date=?")
+            params.append(service_date)
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        rows = self.connection.execute(
+            "SELECT plan_id FROM commitment_plans" + where + " ORDER BY service_date,route_id,plan_id",
+            params,
+        ).fetchall()
+        return {"plans": [self._plan_summary(row["plan_id"]) for row in rows]}

@@ -83,6 +83,25 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/boundaries":
+                return Response(201, self.service.publish_boundary(actor, payload))
+            if method == "POST" and path == "/declarations":
+                return Response(201, self.service.submit_declaration(actor, payload))
+            if method == "POST" and path == "/exemptions":
+                return Response(201, self.service.grant_exemption(actor, payload))
+            if method == "GET" and path == "/plans":
+                return Response(200, self.service.list_plans(
+                    actor,
+                    state=query.get("state", [None])[0],
+                    route_id=query.get("route_id", [None])[0],
+                    service_date=query.get("service_date", [None])[0],
+                ))
+            if method == "GET" and len(parts) == 2 and parts[0] == "plans":
+                return Response(200, self.service.commitment_plan(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "confirm":
+                return Response(200, self.service.confirm_plan(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "receipts":
+                return Response(201, self.service.submit_receipt(actor, parts[1], payload))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})

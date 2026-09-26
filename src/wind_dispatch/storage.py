@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','station','risk','auditor')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -169,6 +169,103 @@ CREATE TABLE IF NOT EXISTS scenario_runs (
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
     UNIQUE(scenario_id, as_of_date, input_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS transmission_boundaries (
+    boundary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    service_date TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    channel_capacity_mw TEXT NOT NULL,
+    cable_thermal_limit_mw TEXT NOT NULL,
+    compensation_mvar TEXT NOT NULL,
+    compensation_ratio TEXT NOT NULL,
+    effective_from TEXT NOT NULL,
+    effective_until TEXT NOT NULL,
+    published_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    published_at TEXT NOT NULL,
+    UNIQUE(route_id, service_date, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_boundaries_route_date
+ON transmission_boundaries(route_id, service_date, version);
+
+CREATE TABLE IF NOT EXISTS station_declarations (
+    declaration_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    service_date TEXT NOT NULL,
+    installed_mw TEXT NOT NULL,
+    availability_percent TEXT NOT NULL,
+    ramp_json TEXT NOT NULL,
+    reserve_mw TEXT NOT NULL,
+    respond_by TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    submitted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_declarations_route_date
+ON station_declarations(route_id, service_date, submitted_at);
+
+CREATE TABLE IF NOT EXISTS commitment_plans (
+    plan_id TEXT PRIMARY KEY,
+    declaration_id TEXT NOT NULL UNIQUE REFERENCES station_declarations(declaration_id),
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    service_date TEXT NOT NULL,
+    boundary_id INTEGER NOT NULL REFERENCES transmission_boundaries(boundary_id),
+    boundary_version INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending','confirmed','settled','cancelled')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('approved','derated','exemption_required')),
+    committed_mw TEXT NOT NULL,
+    phases_json TEXT NOT NULL,
+    evaluation_json TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plans_route_date
+ON commitment_plans(route_id, service_date, state);
+
+CREATE TABLE IF NOT EXISTS exemptions (
+    exemption_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES commitment_plans(plan_id),
+    authorized_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_exemptions_plan
+ON exemptions(plan_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS commitment_locks (
+    lock_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL UNIQUE REFERENCES commitment_plans(plan_id),
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    service_date TEXT NOT NULL,
+    channel_mw TEXT NOT NULL,
+    compensation_mvar TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','released')),
+    exemption_id INTEGER REFERENCES exemptions(exemption_id),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    released_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_locks_route_date
+ON commitment_locks(route_id, service_date, state);
+
+CREATE TABLE IF NOT EXISTS execution_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL UNIQUE REFERENCES commitment_plans(plan_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    actuals_json TEXT NOT NULL,
+    settled_mwh TEXT NOT NULL,
+    shortfall_mwh TEXT NOT NULL,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    submitted_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS supply_idempotency (
